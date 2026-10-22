@@ -58,13 +58,9 @@ PROVIDER_PRIORITY = {
 # Zoom tiers: (grid cell size in degrees, GR Threshold in nautical miles).
 # A station appears in the first (coarsest) tier where it wins its cell.
 # None = every remaining station.
-TIERS = [
-    (2.0,  999),
-    (0.75, 400),
-    (0.25, 150),
-    (0.08,  60),
-    (None,  30),
-]
+   TIERS = [
+       (None, 999),
+   ]
 
 # Drop obs that MADIS QC flagged as questioned/rejected/bad.
 BAD_QC = {"Q", "X", "B"}
