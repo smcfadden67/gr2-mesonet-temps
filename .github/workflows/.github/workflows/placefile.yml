@@ -1,0 +1,43 @@
+yaml
+name: Build mesonet placefile
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"   # every 10 min (GitHub may run it a few minutes late)
+  workflow_dispatch:          # lets you run it by hand from the Actions tab
+
+permissions:
+  contents: write   # push the placefile branch
+  actions: write    # keep the schedule from being auto-disabled
+
+concurrency:
+  group: placefile
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build placefile from MADIS
+        run: python3 build_placefile.py --out mesonet_temps.txt
+
+      - name: Publish to the 'placefile' branch
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir publish && cp mesonet_temps.txt publish/ && cd publish
+          git init -q -b placefile
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add mesonet_temps.txt
+          git commit -q -m "Update placefile $(date -u +%Y-%m-%dT%H:%MZ)"
+          # Force-push a single commit so the branch never grows.
+          git push -q -f "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git" placefile
+
+      - name: Keep the schedule alive
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh api -X PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/placefile.yml/enable" || true
