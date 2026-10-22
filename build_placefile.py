@@ -59,7 +59,7 @@ PROVIDER_PRIORITY = {
 # A station appears in the first (coarsest) tier where it wins its cell.
 # None = every remaining station.
 TIERS = [
-       (None, 999),
+    (None, 999),
 ]
 
 # Drop obs that MADIS QC flagged as questioned/rejected/bad.
@@ -71,36 +71,54 @@ T_MIN_F, T_MAX_F = -60.0, 130.0
 REFRESH_MINUTES = 5
 FONT = '1, 11, 1, "Arial"'
 
-# Temperature color scale (°F -> RGB); interpolated between stops.
-COLOR_STOPS = [
-    (-30, (230, 170, 255)),
-    (-10, (160, 100, 230)),
-    (0,   (90,  90,  255)),
-    (20,  (60,  160, 255)),
-    (32,  (0,   220, 255)),
-    (40,  (60,  230, 160)),
-    (50,  (120, 230, 60)),
-    (60,  (230, 230, 40)),
-    (70,  (255, 190, 30)),
-    (80,  (255, 130, 20)),
-    (90,  (255, 60,  40)),
-    (100, (220, 20,  60)),
-    (110, (255, 100, 200)),
+# Temperature color scale (°F). Stepped bands: each entry is
+# (lower bound, RGB); a temp uses the first band whose lower bound it meets.
+COLOR_BANDS = [
+    ( 125, (254, 254, 254)),
+    ( 120, (251, 223, 223)),
+    ( 115, (247, 192, 192)),
+    ( 110, (244, 160, 160)),
+    ( 105, (240, 128, 128)),
+    ( 100, (202,  88,  87)),
+    (  95, (150,  16,   0)),
+    (  90, (184,  65,   0)),
+    (  85, (219, 115,   0)),
+    (  80, (254, 163,   1)),
+    (  75, (254, 221,   0)),
+    (  70, (254, 254,   0)),
+    (  65, (188, 221,   0)),
+    (  60, (129, 192,   0)),
+    (  55, ( 66, 160,   0)),
+    (  50, (  2, 128,   1)),
+    (  45, ( 34, 153,  57)),
+    (  40, ( 67, 178, 112)),
+    (  35, (101, 204, 170)),
+    (  32, (  0, 250, 254)),
+    (  30, (  0, 168, 254)),
+    (  25, (  0,  86, 255)),
+    (  20, (  0,   1, 254)),
+    (  15, ( 59,  45, 240)),
+    (  10, (103,  79, 230)),
+    (   5, (147, 112, 219)),
+    (   0, (149,   1, 211)),
+    (  -5, (163,  32, 213)),
+    ( -10, (177,  64, 215)),
+    ( -15, (192,  96, 217)),
+    ( -20, (253, 108, 181)),
+    ( -30, (235, 138, 194)),
+    ( -40, (215, 171, 209)),
+    ( -50, (196, 203, 215)),
+    ( -60, (175, 238, 238)),
 ]
 
 MIN_STATIONS_OK = 1000   # fail instead of publishing if far fewer than expected
 
 
 def temp_color(t):
-    if t <= COLOR_STOPS[0][0]:
-        return COLOR_STOPS[0][1]
-    if t >= COLOR_STOPS[-1][0]:
-        return COLOR_STOPS[-1][1]
-    for (t0, c0), (t1, c1) in zip(COLOR_STOPS, COLOR_STOPS[1:]):
-        if t0 <= t <= t1:
-            f = (t - t0) / (t1 - t0)
-            return tuple(round(a + (b - a) * f) for a, b in zip(c0, c1))
-    return (255, 255, 255)
+    for lo, rgb in COLOR_BANDS:
+        if t >= lo:
+            return rgb
+    return COLOR_BANDS[-1][1]
 
 
 def fetch_madis(retries=3):
@@ -211,7 +229,7 @@ def build(stations):
         lines.append(f"Threshold: {thr}")
         last_color = None
         for s in group:
-            color = temp_color(s["tf"])
+            color = temp_color(round(s["tf"]))   # color matches the number shown
             if color != last_color:
                 lines.append("Color: %d %d %d" % color)
                 last_color = color
