@@ -48,8 +48,11 @@ THUMB_TIERS = [
     (0.07, 25),
     (None, 12),
 ]
-# Small camera markers (hover for the name) show at this zoom and closer.
+# Small camera-shaped markers (hover for the name) show at this zoom and closer.
 MARKER_THRESHOLD = 150
+CAM_ICON_BODY = (45, 45, 45)     # dark gray
+CAM_ICON_EDGE = (110, 110, 110)  # faint outline so it shows on black
+CAM_ICON_LENS = (20, 20, 20)
 
 # Regions: (key, title, state, lat_min, lat_max, lon_min, lon_max).
 # A camera goes in the FIRST region whose box contains it.
@@ -148,6 +151,19 @@ def make_thumb(data):
     return canvas
 
 
+def make_camera_icon(path):
+    """Tiny dark camera glyph (body, viewfinder bump, lens) with transparency."""
+    W, H = 12, 9
+    im = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    d = ImageDraw.Draw(im)
+    body, edge, lens = CAM_ICON_BODY + (255,), CAM_ICON_EDGE + (255,), CAM_ICON_LENS + (255,)
+    d.rectangle([3, 0, 5, 1], fill=edge)                     # viewfinder bump
+    d.rectangle([0, 2, W - 1, H - 1], fill=body, outline=edge)
+    d.ellipse([4, 3, 8, 7], fill=lens, outline=edge)          # lens
+    im.save(path, "PNG")
+    return W, H
+
+
 def download_thumb(cam):
     for attempt in range(2):
         try:
@@ -223,7 +239,7 @@ def clean(s):
 
 def build_region(key, title, cams, out_dir, base_url, stamp, epoch):
     per_sheet = SHEET_COLS * SHEET_ROWS
-    max_cams = per_sheet * 32
+    max_cams = per_sheet * 31   # file 1 is the camera icon
     cams = cams[:max_cams]
 
     # Pack sheets in tier order so the zoomed-out tier lives in sheet 1.
@@ -236,7 +252,7 @@ def build_region(key, title, cams, out_dir, base_url, stamp, epoch):
             sheets.append(Image.new("RGB", (THUMB_W * SHEET_COLS, THUMB_H * SHEET_ROWS)))
         r, col = divmod(idx, SHEET_COLS)
         sheets[-1].paste(c["thumb"], (col * THUMB_W, r * THUMB_H))
-        c["file"], c["icon"] = s + 1, idx + 1
+        c["file"], c["icon"] = s + 2, idx + 1
 
     os.makedirs(os.path.join(out_dir, "img"), exist_ok=True)
     lines = [
@@ -247,6 +263,8 @@ def build_region(key, title, cams, out_dir, base_url, stamp, epoch):
         'Font: 1, 11, 1, "Arial"',
         "",
     ]
+    iw, ih = make_camera_icon(os.path.join(out_dir, "img", "camera.png"))
+    lines.append(f'IconFile: 1, {iw}, {ih}, {iw // 2}, {ih // 2}, "{base_url}/img/camera.png"')
     for n, sheet in enumerate(sheets, 1):
         # Crop the last sheet to the rows actually used.
         used = len(ordered) - (n - 1) * per_sheet
@@ -256,13 +274,13 @@ def build_region(key, title, cams, out_dir, base_url, stamp, epoch):
         sheet.save(os.path.join(out_dir, "img", fname), "JPEG",
                    quality=JPEG_QUALITY, optimize=True)
         # ?t= busts caches so GR2 and GitHub serve the new sheet each run.
-        lines.append(f'IconFile: {n}, {THUMB_W}, {THUMB_H}, {THUMB_W // 2}, '
+        lines.append(f'IconFile: {n + 1}, {THUMB_W}, {THUMB_H}, {THUMB_W // 2}, '
                      f'{THUMB_H // 2}, "{base_url}/img/{fname}?t={epoch}"')
     lines.append("")
 
-    lines += [f"Threshold: {MARKER_THRESHOLD}", "Color: 255 255 255"]
+    lines.append(f"Threshold: {MARKER_THRESHOLD}")
     for c in ordered:
-        lines.append(f'Text: {c["lat"]:.5f}, {c["lon"]:.5f}, 1, "o", '
+        lines.append(f'Icon: {c["lat"]:.5f}, {c["lon"]:.5f}, 0, 1, 1, '
                      f'"{clean(c["name"])}\\n{clean(c["src"])} - snapshot {stamp}"')
     lines.append("")
 
