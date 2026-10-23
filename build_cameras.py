@@ -49,7 +49,7 @@ THUMB_TIERS = [
     (None, 12),
 ]
 # Small camera-shaped markers (hover for the name) show at this zoom and closer.
-MARKER_THRESHOLD = 150
+MARKER_THRESHOLD = 60
 CAM_ICON_BODY = (45, 45, 45)     # dark gray
 CAM_ICON_EDGE = (110, 110, 110)  # faint outline so it shows on black
 CAM_ICON_LENS = (20, 20, 20)
