@@ -51,6 +51,10 @@ THUMB_TIERS = [
     (0.12, 18, (204, 136)),
     (None,  8, (144, 96)),
 ]
+# Deep zoom: at this zoom and closer, every decent/rest camera is redrawn at the
+# top-tier size (cameras are sparse enough there that big photos fit).
+DEEP_THRESHOLD = 4
+DEEP_SIZE = THUMB_TIERS[0][2]
 SHEET_SIZE = 2048     # sprite sheets are padded to power-of-two sizes for GR2
 PAD = 2               # black gutter inside each cell (stops edge bleeding)
 SRC_W, SRC_H = 288, 192             # keep each snapshot at the largest tier size
@@ -363,7 +367,8 @@ def pow2(n):
     return p
 
 
-def pack_sheets(ordered, w, h, key, tag, first_file, out_dir, base_url, epoch):
+def pack_sheets(ordered, w, h, key, tag, first_file, out_dir, base_url, epoch,
+                ref="ref"):
     """Pack each camera's thumbnail (w x h) into power-of-two sprite sheets.
     Returns IconFile lines and records (file, icon) on each camera as c['ref'].
     The hotspot is the photo's bottom-left corner, so the photo sits up and to
@@ -378,7 +383,7 @@ def pack_sheets(ordered, w, h, key, tag, first_file, out_dir, base_url, epoch):
         for idx, c in enumerate(chunk):
             r, col = divmod(idx, cols)
             sheet.paste(make_thumb(c["src"], w, h), (col * w, r * h))
-            c["ref"] = (first_file + n, idx + 1)
+            c[ref] = (first_file + n, idx + 1)
         fname = f"{key}_{tag}{n + 1}.jpg"
         sheet.save(os.path.join(out_dir, "img", fname), "JPEG",
                    quality=JPEG_QUALITY, optimize=True)
@@ -392,9 +397,13 @@ def build_region(key, title, cams, out_dir, base_url, stamp, epoch):
     tiers = assign_tiers(cams)
 
     # GR2 allows 32 image files per placefile (1 camera icon + sheets).
+    def per_sheet(sz):
+        return (SHEET_SIZE // sz[0]) * (SHEET_SIZE // sz[1])
+
     def files_needed(ts):
-        return 2 + sum(-(-len(g) // ((SHEET_SIZE // sz[0]) * (SHEET_SIZE // sz[1])))
-                       for _, sz, g in ts)
+        deep = sum(len(g) for _, _, g in ts[1:])
+        return (2 + sum(-(-len(g) // per_sheet(sz)) for _, sz, g in ts)
+                + -(-deep // per_sheet(DEEP_SIZE)))
     while files_needed(tiers) > 32:
         t, sz, g = tiers[-1]
         if not g:
@@ -423,6 +432,12 @@ def build_region(key, title, cams, out_dir, base_url, stamp, epoch):
         lines += fl
         next_file += len(fl)
         n_sheets += len(fl)
+    # Deep-zoom copies of every non-top camera at the top-tier size.
+    deep = sorted([c for _, _, g in tiers[1:] for c in g], key=lambda c: c.get("score", 0.0))
+    fl = pack_sheets(deep, *DEEP_SIZE, key, "deep_", next_file, out_dir, base_url, epoch,
+                     ref="deep_ref")
+    lines += fl
+    n_sheets += len(fl)
     lines.append("")
 
     ordered = [c for *_, g in tiers for c in g]
@@ -433,17 +448,22 @@ def build_region(key, title, cams, out_dir, base_url, stamp, epoch):
                      f'"{clean(c["name"])}\\n{clean(c["src_name"])} - snapshot {stamp}"')
     lines.append("")
 
-    # Lowest-priority tier first, top tier last, so priority cameras sit on top.
-    for thr, _, group in reversed(tiers):
-        if not group:
-            continue
-        lines.append(f"Threshold: {thr}")
-        for c in group:
-            f, i = c["ref"]
-            lines.append(f'Icon: {c["lat"]:.5f}, {c["lon"]:.5f}, 0, {f}, {i}, '
-                         f'"{clean(c["name"])}\\n{clean(c["src_name"])} - {stamp}'
-                         f'\\nView score: {round(100 * c.get("score", 0))}"')
-        lines.append("")
+    def photo(c, ref):
+        f, i = c[ref]
+        return (f'Icon: {c["lat"]:.5f}, {c["lon"]:.5f}, 0, {f}, {i}, '
+                f'"{clean(c["name"])}\\n{clean(c["src_name"])} - {stamp}'
+                f'\\nView score: {round(100 * c.get("score", 0))}"')
+
+    # Lowest-priority tier first so priority cameras sit on top. The deep-zoom
+    # copies go after the small ones (covering them) but before the top tier.
+    for thr, _, group in reversed(tiers[1:]):
+        if group:
+            lines += [f"Threshold: {thr}"] + [photo(c, "ref") for c in group] + [""]
+    if deep:
+        lines += [f"Threshold: {DEEP_THRESHOLD}"] + [photo(c, "deep_ref") for c in deep] + [""]
+    thr, _, group = tiers[0]
+    if group:
+        lines += [f"Threshold: {thr}"] + [photo(c, "ref") for c in group] + [""]
 
     # Location dots last, so they sit on top of every photo.
     for thr, _, group in reversed(tiers):
