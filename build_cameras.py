@@ -64,7 +64,24 @@ REGIONS = [
     ("chicago",    "Chicago metro cameras",     "IL", 41.35, 42.55, -88.75, -87.40),
     ("il_north",   "Northern Illinois cameras", "IL", 40.30, 42.60, -91.60, -87.00),
     ("il_south",   "Southern Illinois cameras", "IL", 36.90, 40.30, -91.60, -87.00),
+    ("milwaukee",  "Milwaukee metro cameras",   "WI", 42.75, 43.40, -88.50, -87.70),
+    ("wi_south",   "Southern Wisconsin cameras", "WI", 42.40, 44.00, -90.70, -86.80),
+    ("wi_other",   "Wisconsin cameras (other)", "WI", 44.00, 47.20, -92.90, -86.80),
 ]
+
+# ------------------------------------------------------------------ camera quality
+# Each camera gets a "view quality" score from its daytime snapshots:
+#   - vegetation: share of green/grassy pixels in the lower 2/3 of the frame
+#     (close-in views of the roadside have lots; wide highway views have little)
+#   - brightness: well-lit images score higher
+#   - sky: views dominated by sky score lower
+# Scores are averaged over many runs (saved in scores.json on the published
+# branch) so the ranking is stable and night/IR images don't reshuffle it.
+# The best-scoring camera in each grid cell gets the zoomed-out thumbnail slot.
+SCORE_WEIGHTS = dict(veg=0.60, bright=0.25, sky=0.15)
+SCORE_SMOOTHING = 0.15        # weight of each new daytime snapshot in the average
+DAYLIGHT_MIN_BRIGHTNESS = 0.22
+DAYLIGHT_MIN_SATURATION = 0.06  # below this the image is IR/grayscale (night)
 
 UA = "gr2-camera-placefile (GR2Analyst placefile builder)"
 
@@ -115,8 +132,9 @@ def fetch_indiana():
     return cams
 
 
-def fetch_illinois():
-    body = json.dumps({"bbox": [-91.6, 36.9, -87.0, 42.6]}).encode()
+def fetch_travelmidwest():
+    """Illinois and Wisconsin cameras from Travel Midwest."""
+    body = json.dumps({"bbox": [-92.9, 36.9, -86.8, 47.2]}).encode()
     raw = http("https://travelmidwest.com/lmiga/cameraMap.json", body,
                {"Content-Type": "application/json", "Accept": "application/json",
                 "Origin": "https://travelmidwest.com",
@@ -124,7 +142,8 @@ def fetch_illinois():
     cams = []
     for f in json.loads(raw).get("features", []):
         p = f.get("properties", {})
-        if not str(p.get("id", "")).startswith("IL-") or p.get("dis"):
+        st = str(p.get("id", ""))[:2]
+        if st not in ("IL", "WI") or p.get("dis"):
             continue
         urls = [u for u in p.get("remUrls") or [] if str(u).startswith("http")]
         if not urls:
@@ -132,7 +151,7 @@ def fetch_illinois():
         lon, lat = f["geometry"]["coordinates"][:2]
         dirs = p.get("dirs") or []
         d = f" ({dirs[0]})" if dirs and dirs[0] not in ("NONE", "") else ""
-        cams.append(dict(state="IL", lat=lat, lon=lon,
+        cams.append(dict(state=st, lat=lat, lon=lon,
                          name=f"{p.get('locDesc', p['id'])}{d}",
                          src=p.get("src", "Travel Midwest"), url=urls[0]))
     return cams
@@ -162,6 +181,63 @@ def make_camera_icon(path):
     d.ellipse([4, 3, 8, 7], fill=lens, outline=edge)          # lens
     im.save(path, "PNG")
     return W, H
+
+
+def cam_key(cam):
+    return f'{cam["state"]}|{cam["lat"]:.4f}|{cam["lon"]:.4f}|{cam["name"]}'
+
+
+def image_metrics(thumb):
+    """Return (vegetation, brightness, sky, saturation) in 0..1 from a thumbnail."""
+    hsv = thumb.convert("HSV")
+    w, h = hsv.size
+    raw = hsv.tobytes()
+    px = [tuple(raw[i:i + 3]) for i in range(0, len(raw), 3)]
+    n = len(px)
+    bright = sum(p[2] for p in px) / (255 * n)
+    sat = sum(p[1] for p in px) / (255 * n)
+    top_end = h // 3
+    veg = sky = 0
+    lower_n = upper_n = 0
+    for i, (hh, ss, vv) in enumerate(px):
+        y = i // w
+        if y < top_end:
+            upper_n += 1
+            # sky: bright, low-saturation or bluish
+            if vv > 140 and (ss < 50 or 130 <= hh <= 175):
+                sky += 1
+        else:
+            lower_n += 1
+            # vegetation: green to yellow-green hues, some saturation and light
+            # (PIL hue 0-255: ~35-110 covers yellow-green through green)
+            if 35 <= hh <= 110 and ss > 40 and vv > 40:
+                veg += 1
+    return veg / max(lower_n, 1), bright, sky / max(upper_n, 1), sat
+
+
+def update_score(cam, history):
+    veg, bright, sky, sat = image_metrics(cam["thumb"])
+    key = cam_key(cam)
+    prev = history.get(key)
+    daylight = bright >= DAYLIGHT_MIN_BRIGHTNESS and sat >= DAYLIGHT_MIN_SATURATION
+    if daylight:
+        now = (SCORE_WEIGHTS["veg"] * min(veg / 0.50, 1.0)
+               + SCORE_WEIGHTS["bright"] * min(bright / 0.6, 1.0)
+               + SCORE_WEIGHTS["sky"] * (1 - sky))
+        score = now if prev is None else prev + SCORE_SMOOTHING * (now - prev)
+    else:
+        score = prev   # keep the daytime average; don't learn from night images
+    cam["score"] = score if score is not None else 0.0
+    if score is not None:
+        history[key] = round(score, 4)
+
+
+def load_history(base_url):
+    try:
+        return json.loads(http(f"{base_url}/scores.json?t={int(time.time())}", timeout=20))
+    except Exception as e:
+        print(f"no previous scores ({e}); starting fresh")
+        return {}
 
 
 def download_thumb(cam):
@@ -217,7 +293,8 @@ def dedupe(cams, tol=0.0015):
 
 
 def assign_tiers(cams):
-    remaining = list(cams)
+    # Best view quality first, so it wins its grid cell in the zoomed-out tiers.
+    remaining = sorted(cams, key=lambda c: -c.get("score", 0.0))
     out = []
     for cell, thr in THUMB_TIERS:
         if cell is None:
@@ -257,7 +334,7 @@ def build_region(key, title, cams, out_dir, base_url, stamp, epoch):
     os.makedirs(os.path.join(out_dir, "img"), exist_ok=True)
     lines = [
         f"; {title} - snapshots shrunk and packed by build_cameras.py, built {stamp}",
-        "; Sources: INDOT (511in.org), Travel Midwest (travelmidwest.com)",
+        "; Sources: INDOT (511in.org), Travel Midwest (travelmidwest.com), WisDOT",
         f"Title: {title} ({stamp})",
         f"Refresh: {REFRESH_MINUTES}",
         'Font: 1, 11, 1, "Arial"',
@@ -290,7 +367,8 @@ def build_region(key, title, cams, out_dir, base_url, stamp, epoch):
         lines.append(f"Threshold: {thr}")
         for c in group:
             lines.append(f'Icon: {c["lat"]:.5f}, {c["lon"]:.5f}, 0, {c["file"]}, '
-                         f'{c["icon"]}, "{clean(c["name"])}\\n{clean(c["src"])} - {stamp}"')
+                         f'{c["icon"]}, "{clean(c["name"])}\\n{clean(c["src"])} - {stamp}'
+                         f'\\nView score: {round(100 * c.get("score", 0))}"')
         lines.append("")
 
     path = os.path.join(out_dir, f"cams_{key}.txt")
@@ -314,7 +392,7 @@ def main():
         cams = demo_cameras()
     else:
         cams = []
-        for name, fn in (("Indiana", fetch_indiana), ("Illinois", fetch_illinois)):
+        for name, fn in (("Indiana", fetch_indiana), ("Illinois/Wisconsin", fetch_travelmidwest)):
             try:
                 got = fn()
                 print(f"{name}: {len(got)} cameras listed")
@@ -329,6 +407,15 @@ def main():
         ok = [c for c in cams if c["thumb"] is not None]
         print(f"downloaded {len(ok)}/{len(cams)} snapshots in {time.time() - t0:.0f}s")
         cams = ok
+
+    history = {} if args.demo else load_history(base_url)
+    for c in cams:
+        update_score(c, history)
+    os.makedirs(args.out_dir, exist_ok=True)
+    with open(os.path.join(args.out_dir, "scores.json"), "w") as f:
+        json.dump(history, f)
+    scored = sum(1 for c in cams if c["score"] > 0)
+    print(f"view scores: {scored}/{len(cams)} cameras have a daytime score")
 
     now = datetime.now(timezone.utc)
     stamp, epoch = now.strftime("%H:%MZ %b %d"), int(now.timestamp())
