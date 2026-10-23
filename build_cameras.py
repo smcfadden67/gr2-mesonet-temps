@@ -33,27 +33,25 @@ from PIL import Image, ImageDraw
 
 # ------------------------------------------------------------------ settings
 
-THUMB_W, THUMB_H = 144, 96          # small thumbnail (zoomed out), 3:2
-SHEET_COLS, SHEET_ROWS = 14, 21     # 2016 x 2016 px sheets, 294 small thumbs each
-LARGE_W, LARGE_H = 216, 144         # enlarged thumbnail (zoomed in), 1.5x
-LARGE_COLS, LARGE_ROWS = 9, 14      # 1944 x 2016 px sheets, 126 large thumbs each
+THUMB_W, THUMB_H = 144, 96          # base (1x) thumbnail size, 3:2; also used for scoring
 JPEG_QUALITY = 72
 DOWNLOAD_THREADS = 24
 DOWNLOAD_TIMEOUT = 15
 REFRESH_MINUTES = 5
 
-# Zoom tiers: (grid cell in degrees, small-thumb Threshold nm, large-thumb Threshold nm).
+# Priority tiers: (grid cell in degrees, GR Threshold nm, thumbnail size, sheet cols x rows).
 # A camera lands in the first tier where it is the best-scoring camera in its
-# grid cell, so the highest-priority cameras show first (zoomed out) and the
-# rest fill in as you zoom. Each camera switches to the enlarged thumbnail once
-# you zoom in past its large Threshold.
-# Draw order: higher-priority tiers are written LAST so GR2 draws them on top,
-# and later (lower-priority) cameras pop up underneath them.
+# grid cell. Each tier has a fixed thumbnail size at every zoom:
+#   top priority  4x area (2x width)    appears at 60 nm
+#   decent        2x area (~1.4x width) appears at 25 nm
+#   rest          1x                    appears at 12 nm
+# Lower tiers are written first so GR2 draws the top tier over them.
 THUMB_TIERS = [
-    (0.20, 60, 25),
-    (0.07, 25, 10),
-    (None, 12, 5),
+    (0.20, 60, (288, 192), (7, 10)),    # 2016 x 1920 sheets, 70 per sheet
+    (0.07, 25, (204, 136), (10, 15)),   # 2040 x 2040 sheets, 150 per sheet
+    (None, 12, (144, 96), (14, 21)),    # 2016 x 2016 sheets, 294 per sheet
 ]
+SRC_W, SRC_H = 288, 192             # keep each snapshot at the largest tier size
 # Small camera-shaped markers (hover for the name) show at this zoom and closer.
 MARKER_THRESHOLD = 60
 CAM_ICON_BODY = (45, 45, 45)     # dark gray
@@ -134,7 +132,7 @@ def fetch_indiana():
         if len(parts) == 2 and parts[0].count("-") >= 3:
             name = parts[1]
         cams.append(dict(state="IN", lat=lat, lon=lon,
-                         name=f"{road.strip()}: {name.strip()}", src="INDOT", url=url))
+                         name=f"{road.strip()}: {name.strip()}", src_name="INDOT", url=url))
     return cams
 
 
@@ -159,7 +157,7 @@ def fetch_travelmidwest():
         d = f" ({dirs[0]})" if dirs and dirs[0] not in ("NONE", "") else ""
         cams.append(dict(state=st, lat=lat, lon=lon,
                          name=f"{p.get('locDesc', p['id'])}{d}",
-                         src=p.get("src", "Travel Midwest"), url=urls[0]))
+                         src_name=p.get("src", "Travel Midwest"), url=urls[0]))
     return cams
 
 
@@ -177,8 +175,9 @@ def make_thumb(src, w, h):
 
 def set_thumbs(cam, data):
     src = Image.open(io.BytesIO(data)).convert("RGB")
+    src.thumbnail((SRC_W, SRC_H), Image.LANCZOS)   # keep memory small
+    cam["src"] = src
     cam["thumb"] = make_thumb(src, THUMB_W, THUMB_H)
-    cam["thumb_l"] = make_thumb(src, LARGE_W, LARGE_H)
 
 
 def make_camera_icon(path):
@@ -268,7 +267,7 @@ def demo_cameras(n_per_region=120):
     for key, _, st, la0, la1, lo0, lo1 in REGIONS:
         for i in range(n_per_region):
             c = dict(state=st, lat=random.uniform(la0, la1), lon=random.uniform(lo0, lo1),
-                     name=f"Demo {key} #{i}", src="demo", url="")
+                     name=f"Demo {key} #{i}", src_name="demo", url="")
             im = Image.new("RGB", (352, 240), tuple(random.randint(0, 255) for _ in range(3)))
             ImageDraw.Draw(im).text((10, 10), f"{key} {i}", fill=(255, 255, 255))
             buf = io.BytesIO()
@@ -311,16 +310,16 @@ def assign_tiers(cams):
     # Best view quality first, so it wins its grid cell in the zoomed-out tiers.
     remaining = sorted(cams, key=lambda c: -c.get("score", 0.0))
     out = []
-    for cell, thr, thr_l in THUMB_TIERS:
+    for cell, thr, size, layout in THUMB_TIERS:
         if cell is None:
-            out.append((thr, thr_l, remaining))
+            out.append((thr, size, layout, remaining))
             break
         taken, rest, cells = [], [], set()
         for c in remaining:
             k = (int((c["lat"] + 90) // cell), int((c["lon"] + 180) // cell))
             (rest if k in cells else taken).append(c)
             cells.add(k)
-        out.append((thr, thr_l, taken))
+        out.append((thr, size, layout, taken))
         remaining = rest
     return out
 
@@ -329,10 +328,10 @@ def clean(s):
     return str(s).replace('"', "'").replace("\n", " ").strip()
 
 
-def pack_sheets(ordered, attr, w, h, cols, rows, key, tag, first_file,
+def pack_sheets(ordered, w, h, cols, rows, key, tag, first_file,
                 out_dir, base_url, epoch):
-    """Pack each camera's thumbnail into sprite sheets. Returns IconFile lines
-    and records (file, icon) on each camera under attr+'_ref'."""
+    """Pack each camera's thumbnail (at w x h) into sprite sheets. Returns
+    IconFile lines and records (file, icon) on each camera as c['ref']."""
     per = cols * rows
     lines = []
     for n in range(-(-len(ordered) // per)):
@@ -341,8 +340,8 @@ def pack_sheets(ordered, attr, w, h, cols, rows, key, tag, first_file,
         sheet = Image.new("RGB", (w * cols, h * used_rows))
         for idx, c in enumerate(chunk):
             r, col = divmod(idx, cols)
-            sheet.paste(c[attr], (col * w, r * h))
-            c[attr + "_ref"] = (first_file + n, idx + 1)
+            sheet.paste(make_thumb(c["src"], w, h), (col * w, r * h))
+            c["ref"] = (first_file + n, idx + 1)
         fname = f"{key}_{tag}{n + 1}.jpg"
         sheet.save(os.path.join(out_dir, "img", fname), "JPEG",
                    quality=JPEG_QUALITY, optimize=True)
@@ -353,19 +352,17 @@ def pack_sheets(ordered, attr, w, h, cols, rows, key, tag, first_file,
 
 
 def build_region(key, title, cams, out_dir, base_url, stamp, epoch):
-    small_per = SHEET_COLS * SHEET_ROWS
-    large_per = LARGE_COLS * LARGE_ROWS
-
-    def files_needed(n):
-        return 1 + -(-n // small_per) + -(-n // large_per)
+    tiers = assign_tiers(cams)
 
     # GR2 allows 32 image files per placefile (1 camera icon + sheets).
-    tiers = assign_tiers(cams)
-    ordered = [c for _, _, group in tiers for c in group]
-    while files_needed(len(ordered)) > 32:
-        ordered = ordered[:-1]
-    keep = set(map(id, ordered))
-    tiers = [(t, tl, [c for c in g if id(c) in keep]) for t, tl, g in tiers]
+    def files_needed(ts):
+        return 1 + sum(-(-len(g) // (lay[0] * lay[1])) for _, _, lay, g in ts)
+    while files_needed(tiers) > 32:
+        t, sz, lay, g = tiers[-1]
+        if not g:
+            tiers = tiers[:-1]
+            continue
+        tiers[-1] = (t, sz, lay, g[:-1])
 
     os.makedirs(os.path.join(out_dir, "img"), exist_ok=True)
     lines = [
@@ -378,42 +375,40 @@ def build_region(key, title, cams, out_dir, base_url, stamp, epoch):
     ]
     iw, ih = make_camera_icon(os.path.join(out_dir, "img", "camera.png"))
     lines.append(f'IconFile: 1, {iw}, {ih}, {iw // 2}, {ih // 2}, "{base_url}/img/camera.png"')
-    small_lines = pack_sheets(ordered, "thumb", THUMB_W, THUMB_H, SHEET_COLS, SHEET_ROWS,
-                              key, "s", 2, out_dir, base_url, epoch)
-    large_lines = pack_sheets(ordered, "thumb_l", LARGE_W, LARGE_H, LARGE_COLS, LARGE_ROWS,
-                              key, "l", 2 + len(small_lines), out_dir, base_url, epoch)
-    lines += small_lines + large_lines + [""]
+    next_file, n_sheets = 2, 0
+    for t_i, (thr, (w, h), (cols, rows), group) in enumerate(tiers):
+        group.sort(key=lambda c: c.get("score", 0.0))    # best drawn last
+        fl = pack_sheets(group, w, h, cols, rows, key, f"t{t_i + 1}_", next_file,
+                         out_dir, base_url, epoch)
+        lines += fl
+        next_file += len(fl)
+        n_sheets += len(fl)
+    lines.append("")
 
-    # Camera markers first, so everything else draws over them.
+    ordered = [c for *_, g in tiers for c in g]
+    # Camera markers first, so thumbnails draw over them.
     lines.append(f"Threshold: {MARKER_THRESHOLD}")
     for c in ordered:
         lines.append(f'Icon: {c["lat"]:.5f}, {c["lon"]:.5f}, 0, 1, 1, '
-                     f'"{clean(c["name"])}\\n{clean(c["src"])} - snapshot {stamp}"')
+                     f'"{clean(c["name"])}\\n{clean(c["src_name"])} - snapshot {stamp}"')
     lines.append("")
 
-    def icon_line(c, ref):
-        f, i = c[ref]
-        return (f'Icon: {c["lat"]:.5f}, {c["lon"]:.5f}, 0, {f}, {i}, '
-                f'"{clean(c["name"])}\\n{clean(c["src"])} - {stamp}'
-                f'\\nView score: {round(100 * c.get("score", 0))}"')
-
-    # Lowest-priority tier first, top tier last, so GR2 paints priority cameras
-    # on top. Within a block, ascending score so the best camera is drawn last.
-    for thr, thr_l, group in reversed(tiers):
+    # Lowest-priority tier first, top tier last, so priority cameras sit on top.
+    for thr, _, _, group in reversed(tiers):
         if not group:
             continue
-        group = sorted(group, key=lambda c: c.get("score", 0.0))
         lines.append(f"Threshold: {thr}")
-        lines += [icon_line(c, "thumb_ref") for c in group]
-        lines.append("")
-        lines.append(f"Threshold: {thr_l}")
-        lines += [icon_line(c, "thumb_l_ref") for c in group]
+        for c in group:
+            f, i = c["ref"]
+            lines.append(f'Icon: {c["lat"]:.5f}, {c["lon"]:.5f}, 0, {f}, {i}, '
+                         f'"{clean(c["name"])}\\n{clean(c["src_name"])} - {stamp}'
+                         f'\\nView score: {round(100 * c.get("score", 0))}"')
         lines.append("")
 
     path = os.path.join(out_dir, f"cams_{key}.txt")
     with open(path, "w", encoding="cp1252", errors="replace", newline="\r\n") as f:
         f.write("\n".join(lines))
-    return len(ordered), len(small_lines) + len(large_lines)
+    return len(ordered), n_sheets
 
 
 # ------------------------------------------------------------------ main
