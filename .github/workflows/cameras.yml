@@ -1,0 +1,46 @@
+name: Build camera placefiles
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"   # every 10 min (GitHub may run it a few minutes late)
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: cameras
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 9
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Pillow
+        run: pip install pillow
+
+      - name: Build camera placefiles
+        run: >
+          python3 build_cameras.py --out-dir cam_out
+          --base-url "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/cameras"
+
+      - name: Publish to the 'cameras' branch
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd cam_out
+          git init -q -b cameras
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -q -m "Update cameras $(date -u +%Y-%m-%dT%H:%MZ)"
+          git push -q -f "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git" cameras
+
+      - name: Keep the schedule alive
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh api -X PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/cameras.yml/enable" || true
