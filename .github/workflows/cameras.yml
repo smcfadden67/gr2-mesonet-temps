@@ -1,8 +1,11 @@
 name: Build camera placefiles
 
+# One run rebuilds the cameras every 5 minutes for ~55 minutes, then ends.
+# The schedule starts a new run every 15 min; extra starts wait in line
+# (one at a time), so there is always a run going with no gaps.
 on:
   schedule:
-    - cron: "*/10 * * * *"   # every 10 min (GitHub may run it a few minutes late)
+    - cron: "*/15 * * * *"
   workflow_dispatch:
 
 permissions:
@@ -16,29 +19,39 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 9
+    timeout-minutes: 70
     steps:
       - uses: actions/checkout@v5
 
       - name: Install Pillow
         run: pip install pillow
 
-      - name: Build camera placefiles
-        run: >
-          python3 build_cameras.py --out-dir cam_out
-          --base-url "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/cameras"
-
-      - name: Publish to the 'cameras' branch
+      - name: Rebuild every 5 minutes
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BASE_URL: https://raw.githubusercontent.com/${{ github.repository }}/cameras
         run: |
-          cd cam_out
-          git init -q -b cameras
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A
-          git commit -q -m "Update cameras $(date -u +%Y-%m-%dT%H:%MZ)"
-          git push -q -f "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git" cameras
+          git config --global user.name  "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          end=$(( $(date +%s) + 55*60 ))
+          while [ "$(date +%s)" -lt "$end" ]; do
+            start=$(date +%s)
+            rm -rf cam_out
+            if python3 build_cameras.py --out-dir cam_out --base-url "$BASE_URL" \
+                 --history "$RUNNER_TEMP/scores.json"; then
+              ( cd cam_out \
+                && git init -q -b cameras \
+                && git add -A \
+                && git commit -q -m "Update cameras $(date -u +%Y-%m-%dT%H:%MZ)" \
+                && git push -q -f "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git" cameras ) \
+                || echo "publish failed; will retry next cycle"
+            else
+              echo "build failed; keeping last good placefiles"
+            fi
+            took=$(( $(date +%s) - start ))
+            echo "cycle took ${took}s"
+            [ "$took" -lt 300 ] && sleep $(( 300 - took ))
+          done
 
       - name: Keep the schedule alive
         env:
