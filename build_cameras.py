@@ -29,7 +29,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFilter, ImageStat
 
 # ------------------------------------------------------------------ settings
 
@@ -37,20 +37,22 @@ THUMB_W, THUMB_H = 144, 96          # base (1x) thumbnail size, 3:2; also used f
 JPEG_QUALITY = 72
 DOWNLOAD_THREADS = 24
 DOWNLOAD_TIMEOUT = 15
-REFRESH_MINUTES = 5
+REFRESH_MINUTES = 2     # GR2 checks often; new images arrive about every 5 min
 
-# Priority tiers: (grid cell in degrees, GR Threshold nm, thumbnail size, sheet cols x rows).
+# Priority tiers: (grid cell in degrees, GR Threshold nm, thumbnail size).
 # A camera lands in the first tier where it is the best-scoring camera in its
 # grid cell. Each tier has a fixed thumbnail size at every zoom:
-#   top priority  4x area (2x width)    appears at 60 nm
-#   decent        2x area (~1.4x width) appears at 25 nm
-#   rest          1x                    appears at 12 nm
+#   top priority  4x area, ~one per 0.35 deg (~24 mi), appears at 60 nm
+#   decent        2x area, ~one per 0.12 deg (~8 mi),  appears at 18 nm
+#   rest          1x,      everything else,            appears at 8 nm
 # Lower tiers are written first so GR2 draws the top tier over them.
 THUMB_TIERS = [
-    (0.20, 60, (288, 192), (7, 10)),    # 2016 x 1920 sheets, 70 per sheet
-    (0.07, 25, (204, 136), (10, 15)),   # 2040 x 2040 sheets, 150 per sheet
-    (None, 12, (144, 96), (14, 21)),    # 2016 x 2016 sheets, 294 per sheet
+    (0.35, 60, (288, 192)),
+    (0.12, 18, (204, 136)),
+    (None,  8, (144, 96)),
 ]
+SHEET_SIZE = 2048     # sprite sheets are padded to power-of-two sizes for GR2
+PAD = 2               # black gutter inside each cell (stops edge bleeding)
 SRC_W, SRC_H = 288, 192             # keep each snapshot at the largest tier size
 # Small camera-shaped markers (hover for the name) show at this zoom and closer.
 MARKER_THRESHOLD = 60
@@ -86,6 +88,7 @@ SCORE_WEIGHTS = dict(veg=0.60, bright=0.25, sky=0.15)
 SCORE_SMOOTHING = 0.15        # weight of each new daytime snapshot in the average
 DAYLIGHT_MIN_BRIGHTNESS = 0.22
 DAYLIGHT_MIN_SATURATION = 0.06  # below this the image is IR/grayscale (night)
+SHARP_GOOD = 0.11     # edge strength of a normal, in-focus road scene (measured)
 
 UA = "gr2-camera-placefile (GR2Analyst placefile builder)"
 
@@ -164,12 +167,14 @@ def fetch_travelmidwest():
 # ------------------------------------------------------------------ images
 
 def make_thumb(src, w, h):
+    iw, ih = w - 2 * PAD, h - 2 * PAD
     im = src.copy()
-    im.thumbnail((w, h), Image.LANCZOS)
+    im.thumbnail((iw, ih), Image.LANCZOS)
     canvas = Image.new("RGB", (w, h), (0, 0, 0))
-    canvas.paste(im, ((w - im.width) // 2, (h - im.height) // 2))
-    # thin border so thumbnails stand out on the radar
-    ImageDraw.Draw(canvas).rectangle([0, 0, w - 1, h - 1], outline=(200, 200, 200))
+    canvas.paste(im, (PAD + (iw - im.width) // 2, PAD + (ih - im.height) // 2))
+    # thin frame so thumbnails stand out on the radar; black gutter outside it
+    ImageDraw.Draw(canvas).rectangle([PAD, PAD, w - 1 - PAD, h - 1 - PAD],
+                                     outline=(200, 200, 200))
     return canvas
 
 
@@ -193,8 +198,19 @@ def make_camera_icon(path):
     return W, H
 
 
+def make_dot(path):
+    """Small white dot with a dark ring: the camera's exact spot, drawn on top."""
+    S = 7
+    im = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+    ImageDraw.Draw(im).ellipse([0, 0, S - 1, S - 1], fill=(255, 255, 255, 255),
+                               outline=(0, 0, 0, 255))
+    im.save(path, "PNG")
+    return S
+
+
 def cam_key(cam):
-    return f'{cam["state"]}|{cam["lat"]:.4f}|{cam["lon"]:.4f}|{cam["name"]}'
+    # "v2": scores restarted when the sharpness check was added
+    return f'v2|{cam["state"]}|{cam["lat"]:.4f}|{cam["lon"]:.4f}|{cam["name"]}'
 
 
 def image_metrics(thumb):
@@ -225,6 +241,13 @@ def image_metrics(thumb):
     return veg / max(lower_n, 1), bright, sky / max(upper_n, 1), sat
 
 
+def sharpness(thumb):
+    """Average edge strength (0..~1). Fogged, smeared or blurry lenses score low."""
+    edges = thumb.convert("L").crop((PAD + 2, PAD + 2, thumb.width - PAD - 2,
+                                     thumb.height - PAD - 2)).filter(ImageFilter.FIND_EDGES)
+    return ImageStat.Stat(edges).mean[0] / 255
+
+
 def update_score(cam, history):
     veg, bright, sky, sat = image_metrics(cam["thumb"])
     key = cam_key(cam)
@@ -234,6 +257,8 @@ def update_score(cam, history):
         now = (SCORE_WEIGHTS["veg"] * min(veg / 0.50, 1.0)
                + SCORE_WEIGHTS["bright"] * min(bright / 0.6, 1.0)
                + SCORE_WEIGHTS["sky"] * (1 - sky))
+        # blurry/obstructed views are scaled down hard
+        now *= min(sharpness(cam["thumb"]) / SHARP_GOOD, 1.0) ** 3
         score = now if prev is None else prev + SCORE_SMOOTHING * (now - prev)
     else:
         score = prev   # keep the daytime average; don't learn from night images
@@ -242,7 +267,10 @@ def update_score(cam, history):
         history[key] = round(score, 4)
 
 
-def load_history(base_url):
+def load_history(base_url, local_path=None):
+    if local_path and os.path.exists(local_path):
+        with open(local_path) as f:
+            return json.load(f)
     try:
         return json.loads(http(f"{base_url}/scores.json?t={int(time.time())}", timeout=20))
     except Exception as e:
@@ -310,16 +338,16 @@ def assign_tiers(cams):
     # Best view quality first, so it wins its grid cell in the zoomed-out tiers.
     remaining = sorted(cams, key=lambda c: -c.get("score", 0.0))
     out = []
-    for cell, thr, size, layout in THUMB_TIERS:
+    for cell, thr, size in THUMB_TIERS:
         if cell is None:
-            out.append((thr, size, layout, remaining))
+            out.append((thr, size, remaining))
             break
         taken, rest, cells = [], [], set()
         for c in remaining:
             k = (int((c["lat"] + 90) // cell), int((c["lon"] + 180) // cell))
             (rest if k in cells else taken).append(c)
             cells.add(k)
-        out.append((thr, size, layout, taken))
+        out.append((thr, size, taken))
         remaining = rest
     return out
 
@@ -328,16 +356,25 @@ def clean(s):
     return str(s).replace('"', "'").replace("\n", " ").strip()
 
 
-def pack_sheets(ordered, w, h, cols, rows, key, tag, first_file,
-                out_dir, base_url, epoch):
-    """Pack each camera's thumbnail (at w x h) into sprite sheets. Returns
-    IconFile lines and records (file, icon) on each camera as c['ref']."""
+def pow2(n):
+    p = 1
+    while p < n:
+        p *= 2
+    return p
+
+
+def pack_sheets(ordered, w, h, key, tag, first_file, out_dir, base_url, epoch):
+    """Pack each camera's thumbnail (w x h) into power-of-two sprite sheets.
+    Returns IconFile lines and records (file, icon) on each camera as c['ref'].
+    The hotspot is the photo's bottom-left corner, so the photo sits up and to
+    the right of the camera and the exact spot stays visible."""
+    cols, rows = SHEET_SIZE // w, SHEET_SIZE // h
     per = cols * rows
     lines = []
     for n in range(-(-len(ordered) // per)):
         chunk = ordered[n * per:(n + 1) * per]
         used_rows = -(-len(chunk) // cols)
-        sheet = Image.new("RGB", (w * cols, h * used_rows))
+        sheet = Image.new("RGB", (SHEET_SIZE, pow2(used_rows * h)))
         for idx, c in enumerate(chunk):
             r, col = divmod(idx, cols)
             sheet.paste(make_thumb(c["src"], w, h), (col * w, r * h))
@@ -346,7 +383,7 @@ def pack_sheets(ordered, w, h, cols, rows, key, tag, first_file,
         sheet.save(os.path.join(out_dir, "img", fname), "JPEG",
                    quality=JPEG_QUALITY, optimize=True)
         # ?t= busts caches so GR2 and GitHub serve the new sheet each run.
-        lines.append(f'IconFile: {first_file + n}, {w}, {h}, {w // 2}, {h // 2}, '
+        lines.append(f'IconFile: {first_file + n}, {w}, {h}, {PAD}, {h - 1 - PAD}, '
                      f'"{base_url}/img/{fname}?t={epoch}"')
     return lines
 
@@ -356,13 +393,14 @@ def build_region(key, title, cams, out_dir, base_url, stamp, epoch):
 
     # GR2 allows 32 image files per placefile (1 camera icon + sheets).
     def files_needed(ts):
-        return 1 + sum(-(-len(g) // (lay[0] * lay[1])) for _, _, lay, g in ts)
+        return 2 + sum(-(-len(g) // ((SHEET_SIZE // sz[0]) * (SHEET_SIZE // sz[1])))
+                       for _, sz, g in ts)
     while files_needed(tiers) > 32:
-        t, sz, lay, g = tiers[-1]
+        t, sz, g = tiers[-1]
         if not g:
             tiers = tiers[:-1]
             continue
-        tiers[-1] = (t, sz, lay, g[:-1])
+        tiers[-1] = (t, sz, g[:-1])
 
     os.makedirs(os.path.join(out_dir, "img"), exist_ok=True)
     lines = [
@@ -375,10 +413,12 @@ def build_region(key, title, cams, out_dir, base_url, stamp, epoch):
     ]
     iw, ih = make_camera_icon(os.path.join(out_dir, "img", "camera.png"))
     lines.append(f'IconFile: 1, {iw}, {ih}, {iw // 2}, {ih // 2}, "{base_url}/img/camera.png"')
-    next_file, n_sheets = 2, 0
-    for t_i, (thr, (w, h), (cols, rows), group) in enumerate(tiers):
+    ds = make_dot(os.path.join(out_dir, "img", "dot.png"))
+    lines.append(f'IconFile: 2, {ds}, {ds}, {ds // 2}, {ds // 2}, "{base_url}/img/dot.png"')
+    next_file, n_sheets = 3, 0
+    for t_i, (thr, (w, h), group) in enumerate(tiers):
         group.sort(key=lambda c: c.get("score", 0.0))    # best drawn last
-        fl = pack_sheets(group, w, h, cols, rows, key, f"t{t_i + 1}_", next_file,
+        fl = pack_sheets(group, w, h, key, f"t{t_i + 1}_", next_file,
                          out_dir, base_url, epoch)
         lines += fl
         next_file += len(fl)
@@ -394,7 +434,7 @@ def build_region(key, title, cams, out_dir, base_url, stamp, epoch):
     lines.append("")
 
     # Lowest-priority tier first, top tier last, so priority cameras sit on top.
-    for thr, _, _, group in reversed(tiers):
+    for thr, _, group in reversed(tiers):
         if not group:
             continue
         lines.append(f"Threshold: {thr}")
@@ -403,6 +443,16 @@ def build_region(key, title, cams, out_dir, base_url, stamp, epoch):
             lines.append(f'Icon: {c["lat"]:.5f}, {c["lon"]:.5f}, 0, {f}, {i}, '
                          f'"{clean(c["name"])}\\n{clean(c["src_name"])} - {stamp}'
                          f'\\nView score: {round(100 * c.get("score", 0))}"')
+        lines.append("")
+
+    # Location dots last, so they sit on top of every photo.
+    for thr, _, group in reversed(tiers):
+        if not group:
+            continue
+        lines.append(f"Threshold: {thr}")
+        for c in group:
+            lines.append(f'Icon: {c["lat"]:.5f}, {c["lon"]:.5f}, 0, 2, 1, '
+                         f'"{clean(c["name"])}"')
         lines.append("")
 
     path = os.path.join(out_dir, f"cams_{key}.txt")
@@ -419,6 +469,7 @@ def main():
     ap.add_argument("--base-url", required=True,
                     help="public URL of the folder the output is published to")
     ap.add_argument("--demo", action="store_true", help="use fake cameras (offline test)")
+    ap.add_argument("--history", help="local scores file kept between runs (loop mode)")
     args = ap.parse_args()
     base_url = args.base_url.rstrip("/")
 
@@ -442,12 +493,15 @@ def main():
         print(f"downloaded {len(ok)}/{len(cams)} snapshots in {time.time() - t0:.0f}s")
         cams = ok
 
-    history = {} if args.demo else load_history(base_url)
+    history = {} if args.demo else load_history(base_url, args.history)
     for c in cams:
         update_score(c, history)
     os.makedirs(args.out_dir, exist_ok=True)
     with open(os.path.join(args.out_dir, "scores.json"), "w") as f:
         json.dump(history, f)
+    if args.history:
+        with open(args.history, "w") as f:
+            json.dump(history, f)
     scored = sum(1 for c in cams if c["score"] > 0)
     print(f"view scores: {scored}/{len(cams)} cameras have a daytime score")
 
