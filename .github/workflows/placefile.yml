@@ -2,12 +2,12 @@ name: Build mesonet placefile
 
 on:
   schedule:
-    - cron: "*/10 * * * *"   # every 10 min (GitHub may run it a few minutes late)
-  workflow_dispatch:          # lets you run it by hand from the Actions tab
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
 
 permissions:
-  contents: write   # push the placefile branch
-  actions: write    # keep the schedule from being auto-disabled
+  contents: write
+  actions: write
 
 concurrency:
   group: placefile
@@ -16,25 +16,33 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 70
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - name: Build placefile from MADIS
-        run: python3 build_placefile.py --out mesonet_temps.txt
-
-      - name: Publish to the 'placefile' branch
+      - name: Rebuild every 5 minutes
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          mkdir publish && cp mesonet_temps.txt publish/ && cd publish
-          git init -q -b placefile
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add mesonet_temps.txt
-          git commit -q -m "Update placefile $(date -u +%Y-%m-%dT%H:%MZ)"
-          # Force-push a single commit so the branch never grows.
-          git push -q -f "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git" placefile
+          git config --global user.name  "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          end=$(( $(date +%s) + 55*60 ))
+          while [ "$(date +%s)" -lt "$end" ]; do
+            start=$(date +%s)
+            if python3 build_placefile.py --out mesonet_temps.txt; then
+              rm -rf publish && mkdir publish && cp mesonet_temps.txt publish/ && cd publish
+              git init -q -b placefile
+              git add mesonet_temps.txt
+              git commit -q -m "Update placefile $(date -u +%Y-%m-%dT%H:%MZ)"
+              git push -q -f "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git" placefile \
+                || echo "publish failed; will retry next cycle"
+              cd ..
+            else
+              echo "build failed; keeping last good placefile"
+            fi
+            took=$(( $(date +%s) - start ))
+            [ "$took" -lt 300 ] && sleep $(( 300 - took ))
+          done
 
       - name: Keep the schedule alive
         env:
